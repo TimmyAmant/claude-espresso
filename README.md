@@ -12,7 +12,7 @@ Give Claude a big task. If the limit hits, Claude Espresso waits the exact right
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/claude-espresso/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/TimmyAmant/claude-espresso/main/install.sh | bash
 ```
 
 Then restart Claude Code.
@@ -147,7 +147,7 @@ The hooks (`Stop`, `statusLine`) and skills work on all platforms — only the b
 
 ## vs. other tools
 
-| | Claude Espresso | [autoclaude](https://github.com/henryaj/autoclaude) | [claude-auto-resume](https://github.com/terryso/claude-auto-resume) |
+| | [Claude Espresso](https://github.com/TimmyAmant/claude-espresso) | [autoclaude](https://github.com/henryaj/autoclaude) | [claude-auto-resume](https://github.com/terryso/claude-auto-resume) |
 |---|---|---|---|
 | Requires tmux | No | Yes | No |
 | Wraps the claude command | No | No | Yes |
