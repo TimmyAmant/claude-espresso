@@ -58,8 +58,6 @@ Claude asks what you're working on, writes the checkpoint, and starts. You don't
 
 ## Skills
 
-![Installed commands](screenshots/01-commands.png)
-
 Claude Espresso adds 10 slash commands. Here's what each one does:
 
 ### Core
@@ -91,26 +89,6 @@ Claude Espresso adds 10 slash commands. Here's what each one does:
 | `/limit-auto` | Arm this project automatically on every session — no manual `/limit-restart` needed |
 | `/limit-always` | Arm every project globally, every session |
 | `/limit-always-off` | Disable global auto-arm |
-
----
-
-## Screenshots
-
-**`/limit-status` — see exactly what's queued and when**
-
-![limit-status](screenshots/02-status.png)
-
-**`/limit-list` — all projects at a glance**
-
-![limit-list](screenshots/04-list.png)
-
-**Checkpoint file — what Claude reads on every resume**
-
-![checkpoint](screenshots/03-checkpoint.png)
-
-**Auto-resume — what happens when the window resets**
-
-![auto-resume](screenshots/05-auto-resume.png)
 
 ---
 
