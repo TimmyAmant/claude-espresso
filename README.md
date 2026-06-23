@@ -6,7 +6,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Claude Code](https://img.shields.io/badge/Claude%20Code-required-orange)
 
-Give Claude a big task and walk away. If the limit hits, Claude Espresso waits the exact right amount of time and picks up exactly where it left off — whether you're asleep, in a meeting, or just done watching a timer.
+Give Claude a long task and walk away. If the usage limit hits mid-task, Claude Espresso calculates the exact reset time, waits, and resumes automatically — picking up from the precise step where it left off. No polling, no wrappers, no terminal tricks.
 
 ---
 
@@ -18,97 +18,105 @@ cd claude-espresso
 bash install.sh
 ```
 
-Then **restart Claude Code** to activate the hooks.
+Restart Claude Code to activate the hooks.
 
 **Requirements**
 
-| Requirement | macOS | Linux | Windows |
+| | macOS | Linux | Windows |
 |---|---|---|---|
-| [Claude Code](https://claude.ai/code) | ✅ | ✅ | ✅ (Git Bash or WSL) |
+| [Claude Code](https://claude.ai/code) | ✅ | ✅ | ✅ Git Bash / WSL |
 | Python 3 | ✅ built-in | ✅ built-in | ✅ |
 | jq | `brew install jq` | `sudo apt install jq` | `winget install jqlang.jq` |
 
 ---
 
-## Usage
+## How It Works
 
-At the start of any long task, type:
+Claude Espresso installs three native Claude Code hooks that run silently in the background:
+
+1. **After every response** — a `statusLine` hook reads Claude Code's live rate-limit data and saves the exact 5-hour and 7-day reset timestamps.
+
+2. **When the session ends** — a `Stop` hook cross-references those timestamps with session start time to calculate precisely how long remains on your window, and writes a pending resume file with the exact wakeup time. If you were 3 hours into a 5-hour window, it schedules a resume in **2 hours**, not 5.
+
+3. **In the background** — a scheduler (launchd on macOS, cron on Linux, Task Scheduler on Windows) polls every 15 minutes. The moment your reset time passes, Claude Code relaunches headlessly in your project directory and resumes from the checkpoint.
+
+If Claude hits the limit again mid-resume, the whole cycle repeats until the task is marked complete.
+
+---
+
+## Quick Start
+
+At the start of any long task:
 
 ```
 /limit-restart
 ```
 
-Claude will ask what you're working on, write a checkpoint file, and begin. From that point, **you don't need to do anything else.**
-
-When the limit hits:
-- The exact reset time is read from Claude Code's own session data
-- A background process wakes up at the right moment
-- Claude resumes in your project directory, reads the checkpoint, and keeps going
+Claude asks what you're working on, writes the checkpoint, and starts. You don't need to do anything else — even if the limit hits while you're asleep.
 
 ---
 
 ## Skills
 
-Claude Espresso installs 10 slash commands for full control over your queued resumes.
+![Installed commands](screenshots/01-commands.png)
+
+Claude Espresso adds 10 slash commands. Here's what each one does:
 
 ### Core
 
-| Command | What it does |
+| Command | Description |
 |---|---|
-| `/limit-restart` | Arm Espresso for the current task — describe what you're working on and Claude writes the checkpoint |
+| `/limit-restart` | Arm Espresso — describe the task and Claude writes the checkpoint |
 | `/limit-cancel` | Cancel a queued resume and mark the task cancelled |
-| `/limit-pause` | Pause a queued resume without losing the checkpoint — re-arm later with `/limit-restart` |
-| `/limit-retry` | Re-queue the resume with a freshly calculated reset time — use when the scheduled time looks wrong |
+| `/limit-pause` | Pause without losing the checkpoint — re-arm later with `/limit-restart` |
+| `/limit-retry` | Re-queue with a freshly calculated reset time |
 
 ### Visibility
 
-| Command | What it does |
+| Command | Description |
 |---|---|
-| `/limit-status` | Show the current Espresso state for this project: checkpoint status, resume time, and rate limit percentages |
-| `/limit-list` | List every project that has a queued or armed Espresso resume |
+| `/limit-status` | Show checkpoint status, queued resume time, and live rate-limit percentages |
+| `/limit-list` | List every project with a queued or armed resume |
 
 ### Notifications
 
-| Command | What it does |
+| Command | Description |
 |---|---|
 | `/limit-notify` | Schedule a macOS desktop notification to fire when the resume is about to happen |
 
 ### Auto-arm
 
-| Command | What it does |
+| Command | Description |
 |---|---|
-| `/limit-auto` | Enable auto-arm for this project — Espresso arms itself on every session, no manual `/limit-restart` needed |
-| `/limit-always` | Enable auto-arm globally — every project, every session, without any setup |
+| `/limit-auto` | Arm this project automatically on every session — no manual `/limit-restart` needed |
+| `/limit-always` | Arm every project globally, every session |
 | `/limit-always-off` | Disable global auto-arm |
 
 ---
 
-## How It Works
+## Screenshots
 
-Claude Espresso is built entirely on Claude Code's native hook system — no wrappers, no screen-scraping, no polling the terminal.
+**`/limit-status` — see exactly what's queued and when**
 
-### 1. While Claude works
-A `statusLine` hook fires after every response and captures the **exact** 5-hour and 7-day reset timestamps directly from Claude Code's rate limit data.
+![limit-status](screenshots/02-status.png)
 
-### 2. When the session ends
-A `Stop` hook reads Claude Code's own session file (`~/.claude/sessions/{pid}.json`) to identify the project directory and session start time. It cross-references the saved reset timestamps, determines whether you hit the 5-hour or weekly limit, and writes a pending resume file with the precise wakeup time.
+**`/limit-list` — all projects at a glance**
 
-If you were 3 hours into your window, it schedules a resume in **2 hours**, not 5.
+![limit-list](screenshots/04-list.png)
 
-### 3. In the background
-A scheduler (launchd on macOS, cron on Linux, Task Scheduler on Windows) runs `resume-check.sh` every 15 minutes. The moment your reset time passes, it launches Claude Code headlessly in your project directory and resumes from the checkpoint.
+**Checkpoint file — what Claude reads on every resume**
 
-### 4. Handles weekly limits too
-If your 7-day cap is exhausted — not just the 5-hour window — Claude Espresso detects it from the usage percentage, queues a resume for the weekly reset time, and sends you a system notification so you know the wait is longer than usual.
+![checkpoint](screenshots/03-checkpoint.png)
 
-### 5. Chains automatically
-If Claude hits the limit again during a resumed session, the whole process repeats. Claude Espresso keeps going until the task is marked complete.
+**Auto-resume — what happens when the window resets**
+
+![auto-resume](screenshots/05-auto-resume.png)
 
 ---
 
 ## Checkpoint File
 
-Each project gets a `.claude/checkpoint.md` that Claude updates after every significant step:
+Each project gets a `.claude/checkpoint.md` that Claude updates after every significant step. On each resume, Claude reads this file and continues from the exact step it was on.
 
 ```
 status: in_progress
@@ -140,7 +148,7 @@ Using RS256 per existing codebase convention
 resumed_at: 2026-06-23T17:09:02Z
 ```
 
-If the limit hits mid-step, the previous completed step is always preserved. On each resume, Claude immediately writes a `resumed_at` timestamp before doing any work — so even if the limit hits again immediately, there's a record of the session.
+Even if the limit hits immediately after a resume, the `resumed_at` timestamp is written first — so there's always a record of the session.
 
 ---
 
@@ -150,24 +158,13 @@ If the limit hits mid-step, the previous completed step is always preserved. On 
 
 | File | Purpose |
 |---|---|
-| `~/.claude/scripts/stop-hook.sh` | Fires on every session end — computes exact reset time and queues resume |
+| `~/.claude/scripts/stop-hook.sh` | Fires on every session end — computes exact reset time, queues resume |
 | `~/.claude/scripts/statusline-hook.sh` | Fires after every response — saves live reset timestamps |
-| `~/.claude/scripts/resume-check.sh` | Runs every 15 min — wakes Claude when the time is right |
+| `~/.claude/scripts/resume-check.sh` | Runs every 15 min — launches Claude Code when the reset window passes |
 
-**Skills**
+**Skills** (`~/.claude/commands/`)
 
-| File | Slash command |
-|---|---|
-| `~/.claude/commands/limit-restart.md` | `/limit-restart` |
-| `~/.claude/commands/limit-cancel.md` | `/limit-cancel` |
-| `~/.claude/commands/limit-pause.md` | `/limit-pause` |
-| `~/.claude/commands/limit-retry.md` | `/limit-retry` |
-| `~/.claude/commands/limit-status.md` | `/limit-status` |
-| `~/.claude/commands/limit-list.md` | `/limit-list` |
-| `~/.claude/commands/limit-notify.md` | `/limit-notify` |
-| `~/.claude/commands/limit-auto.md` | `/limit-auto` |
-| `~/.claude/commands/limit-always.md` | `/limit-always` |
-| `~/.claude/commands/limit-always-off.md` | `/limit-always-off` |
+`limit-restart` · `limit-cancel` · `limit-pause` · `limit-retry` · `limit-status` · `limit-list` · `limit-notify` · `limit-auto` · `limit-always` · `limit-always-off`
 
 **System**
 
@@ -175,22 +172,22 @@ If the limit hits mid-step, the previous completed step is always preserved. On 
 |---|---|
 | `~/Library/LaunchAgents/com.claude.espresso.plist` | macOS background agent (launchd) |
 
-`~/.claude/settings.json` is updated to wire up the `Stop` and `statusLine` hooks. **All existing settings are preserved.** The installer is safe to run multiple times.
+`~/.claude/settings.json` is updated to wire up the `Stop` and `statusLine` hooks. All existing settings are preserved. Safe to run the installer multiple times.
 
 ---
 
-## Pairs Well With These Built-in Claude Code Skills
+## Pairs Well With
 
-| Skill | What it does | Why it pairs well |
-|---|---|---|
-| `/init` | Writes a `CLAUDE.md` for your project | Claude reads `CLAUDE.md` on every startup, including every auto-resume — project context carries through automatically |
-| `/code-review` | Reviews the current diff | Run after a long resumed session to catch anything that drifted across multiple sessions |
-| `/schedule` | Runs a Claude agent on a schedule | `/schedule` handles the timing, Claude Espresso handles limit hits within each run |
+| Skill | Why |
+|---|---|
+| `/init` | Writes a `CLAUDE.md` for your project — Claude reads it on every resume, so context carries through automatically |
+| `/code-review` | Run after a long resumed session to catch anything that drifted across multiple sessions |
+| `/schedule` | Handles the timing of scheduled runs; Espresso handles limit hits within each run |
 
-**Recommended workflow for big tasks:**
-1. Run `/init` once to write your project's `CLAUDE.md`
-2. Run `/limit-restart` at the start of each major task
-3. Run `/code-review` when it finishes to verify the work
+**Recommended workflow:**
+1. `/init` — write `CLAUDE.md` once for your project
+2. `/limit-restart` — arm Espresso at the start of each major task
+3. `/code-review` — verify the work when it finishes
 
 ---
 
@@ -198,37 +195,39 @@ If the limit hits mid-step, the previous completed step is always preserved. On 
 
 | | Claude Espresso | [autoclaude](https://github.com/henryaj/autoclaude) | [claude-auto-resume](https://github.com/terryso/claude-auto-resume) |
 |---|---|---|---|
-| Install method | `git clone` | Homebrew / Go binary | Shell script |
+| Install | `git clone` | Homebrew / Go binary | Shell script |
 | Requires tmux | No | Yes | No |
-| Wraps `claude` command | No | No | Yes |
-| Reset time source | Claude's own session + statusLine data | Parses terminal UI | Watches CLI output |
+| Wraps `claude` CLI | No | No | Yes |
+| Reset time source | Claude's own session data | Parses terminal UI | Watches CLI output |
 | Handles weekly limit | Yes | No | No |
-| Saves task context across sessions | Yes (checkpoint file) | No | No |
-| Works in Claude Code desktop app | Yes | No | No |
-| Handles multiple limit hits | Yes | Yes | Yes |
+| Saves task context | Yes (checkpoint file) | No | No |
+| Works in desktop app | Yes | No | No |
+| Chains on repeated hits | Yes | Yes | Yes |
 
 ---
 
 ## Security
 
-When Claude resumes headlessly, it uses `--dangerously-skip-permissions`. This allows it to read, write, and run commands in your project without prompting — which is required for fully unattended operation.
+When Claude resumes headlessly, it runs with `--dangerously-skip-permissions` — allowing it to read, write, and execute in your project without prompting. This is required for unattended operation.
 
-Only use `/limit-restart` in projects where you're comfortable with Claude operating autonomously. The checkpoint file lives in `.claude/checkpoint.md` inside your project, so you can always inspect what Claude is planning to do next.
+Only run `/limit-restart` in projects where you're comfortable with Claude operating autonomously. The checkpoint file at `.claude/checkpoint.md` always shows exactly what Claude plans to do next.
 
 ---
 
 ## Uninstall
 
 ```bash
-# Stop and remove the background checker
+# Remove the background scheduler
 launchctl unload ~/Library/LaunchAgents/com.claude.espresso.plist
 rm ~/Library/LaunchAgents/com.claude.espresso.plist
 
-# Remove scripts and skills
+# Remove scripts
 rm ~/.claude/scripts/stop-hook.sh \
    ~/.claude/scripts/statusline-hook.sh \
-   ~/.claude/scripts/resume-check.sh \
-   ~/.claude/commands/limit-restart.md \
+   ~/.claude/scripts/resume-check.sh
+
+# Remove skills
+rm ~/.claude/commands/limit-restart.md \
    ~/.claude/commands/limit-cancel.md \
    ~/.claude/commands/limit-pause.md \
    ~/.claude/commands/limit-retry.md \
@@ -246,11 +245,11 @@ Then open `~/.claude/settings.json` and remove the `statusLine` key and the `Sto
 
 ## Contributing
 
-PRs welcome. The biggest gaps:
+PRs welcome. Current gaps:
 
-- **Linux:** Cron is installed but not tested across distros — reports welcome
-- **Windows:** Task Scheduler path via Git Bash needs real-world testing
-- **Notifications:** Linux `notify-send` and Windows PowerShell toast need testing
+- **Linux** — cron is wired up but needs real-world testing across distros
+- **Windows** — Task Scheduler path via Git Bash needs validation
+- **Notifications** — Linux `notify-send` and Windows PowerShell toast paths need testing
 
 ---
 
