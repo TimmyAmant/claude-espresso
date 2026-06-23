@@ -45,11 +45,41 @@ When the limit hits:
 - A background process wakes up at the right moment
 - Claude resumes in your project directory, reads the checkpoint, and keeps going
 
-To cancel a queued resume at any time:
+---
 
-```
-/limit-cancel
-```
+## Skills
+
+Claude Espresso installs 10 slash commands for full control over your queued resumes.
+
+### Core
+
+| Command | What it does |
+|---|---|
+| `/limit-restart` | Arm Espresso for the current task — describe what you're working on and Claude writes the checkpoint |
+| `/limit-cancel` | Cancel a queued resume and mark the task cancelled |
+| `/limit-pause` | Pause a queued resume without losing the checkpoint — re-arm later with `/limit-restart` |
+| `/limit-retry` | Re-queue the resume with a freshly calculated reset time — use when the scheduled time looks wrong |
+
+### Visibility
+
+| Command | What it does |
+|---|---|
+| `/limit-status` | Show the current Espresso state for this project: checkpoint status, resume time, and rate limit percentages |
+| `/limit-list` | List every project that has a queued or armed Espresso resume |
+
+### Notifications
+
+| Command | What it does |
+|---|---|
+| `/limit-notify` | Schedule a macOS desktop notification to fire when the resume is about to happen |
+
+### Auto-arm
+
+| Command | What it does |
+|---|---|
+| `/limit-auto` | Enable auto-arm for this project — Espresso arms itself on every session, no manual `/limit-restart` needed |
+| `/limit-always` | Enable auto-arm globally — every project, every session, without any setup |
+| `/limit-always-off` | Disable global auto-arm |
 
 ---
 
@@ -116,13 +146,33 @@ If the limit hits mid-step, the previous completed step is always preserved. On 
 
 ## What Gets Installed
 
+**Scripts**
+
 | File | Purpose |
 |---|---|
 | `~/.claude/scripts/stop-hook.sh` | Fires on every session end — computes exact reset time and queues resume |
 | `~/.claude/scripts/statusline-hook.sh` | Fires after every response — saves live reset timestamps |
 | `~/.claude/scripts/resume-check.sh` | Runs every 15 min — wakes Claude when the time is right |
-| `~/.claude/commands/limit-restart.md` | The `/limit-restart` skill |
-| `~/.claude/commands/limit-cancel.md` | The `/limit-cancel` skill |
+
+**Skills**
+
+| File | Slash command |
+|---|---|
+| `~/.claude/commands/limit-restart.md` | `/limit-restart` |
+| `~/.claude/commands/limit-cancel.md` | `/limit-cancel` |
+| `~/.claude/commands/limit-pause.md` | `/limit-pause` |
+| `~/.claude/commands/limit-retry.md` | `/limit-retry` |
+| `~/.claude/commands/limit-status.md` | `/limit-status` |
+| `~/.claude/commands/limit-list.md` | `/limit-list` |
+| `~/.claude/commands/limit-notify.md` | `/limit-notify` |
+| `~/.claude/commands/limit-auto.md` | `/limit-auto` |
+| `~/.claude/commands/limit-always.md` | `/limit-always` |
+| `~/.claude/commands/limit-always-off.md` | `/limit-always-off` |
+
+**System**
+
+| File | Purpose |
+|---|---|
 | `~/Library/LaunchAgents/com.claude.espresso.plist` | macOS background agent (launchd) |
 
 `~/.claude/settings.json` is updated to wire up the `Stop` and `statusLine` hooks. **All existing settings are preserved.** The installer is safe to run multiple times.
@@ -179,7 +229,15 @@ rm ~/.claude/scripts/stop-hook.sh \
    ~/.claude/scripts/statusline-hook.sh \
    ~/.claude/scripts/resume-check.sh \
    ~/.claude/commands/limit-restart.md \
-   ~/.claude/commands/limit-cancel.md
+   ~/.claude/commands/limit-cancel.md \
+   ~/.claude/commands/limit-pause.md \
+   ~/.claude/commands/limit-retry.md \
+   ~/.claude/commands/limit-status.md \
+   ~/.claude/commands/limit-list.md \
+   ~/.claude/commands/limit-notify.md \
+   ~/.claude/commands/limit-auto.md \
+   ~/.claude/commands/limit-always.md \
+   ~/.claude/commands/limit-always-off.md
 ```
 
 Then open `~/.claude/settings.json` and remove the `statusLine` key and the `Stop` entry under `hooks`.
