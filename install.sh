@@ -65,11 +65,17 @@ cat > "$HOME/.claude/scripts/stop-hook.sh" << 'STOP_HOOK'
 
 PENDING_DIR="$HOME/.claude/pending-resumes"
 STATE_FILE="$HOME/.claude/rate-limit-state.json"
+LOG="$HOME/.claude/espresso.log"
 mkdir -p "$PENDING_DIR"
 
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [stop] $1" >> "$LOG"; }
+
 HOOK_INPUT=$(cat)
-SESSION_ID=$(echo "$HOOK_INPUT" | jq -r '.session_id // ""')
-if [[ -z "$SESSION_ID" ]]; then exit 0; fi
+SESSION_ID=$(echo "$HOOK_INPUT" | jq -r '.session_id // .sessionId // ""')
+if [[ -z "$SESSION_ID" ]]; then
+    log "no session_id in hook input — skipping"
+    exit 0
+fi
 
 SESSION_FILE=""
 for f in "$HOME/.claude/sessions/"*.json; do
@@ -77,54 +83,95 @@ for f in "$HOME/.claude/sessions/"*.json; do
     SID=$(jq -r '.sessionId // ""' "$f" 2>/dev/null)
     if [[ "$SID" == "$SESSION_ID" ]]; then SESSION_FILE="$f"; break; fi
 done
-if [[ -z "$SESSION_FILE" ]]; then exit 0; fi
+if [[ -z "$SESSION_FILE" ]]; then
+    log "no session file found for session_id=$SESSION_ID — skipping"
+    exit 0
+fi
 
 CWD=$(jq -r '.cwd // ""' "$SESSION_FILE" 2>/dev/null)
 STARTED_AT_MS=$(jq -r '.startedAt // 0' "$SESSION_FILE" 2>/dev/null)
-if [[ -z "$CWD" ]]; then exit 0; fi
+if [[ -z "$CWD" ]]; then
+    log "no cwd in session file $SESSION_FILE — skipping"
+    exit 0
+fi
 
 CHECKPOINT="$CWD/.claude/checkpoint.md"
-if [[ ! -f "$CHECKPOINT" ]]; then exit 0; fi
+if [[ ! -f "$CHECKPOINT" ]]; then
+    log "no checkpoint at $CHECKPOINT — skipping (run /limit-restart to arm Espresso)"
+    exit 0
+fi
 
 STATUS=$(grep -m1 '^status:' "$CHECKPOINT" 2>/dev/null | sed 's/status:[[:space:]]*//' | tr -d '"' | tr -d "'" | xargs)
-if [[ "$STATUS" != "in_progress" ]]; then exit 0; fi
+if [[ "$STATUS" != "in_progress" ]]; then
+    log "checkpoint status='$STATUS' (not in_progress) for $(basename "$CWD") — skipping"
+    exit 0
+fi
 
 NOW=$(date +%s)
 
 CWD="$CWD" STARTED_AT_MS="$STARTED_AT_MS" SESSION_ID="$SESSION_ID" \
-STATE_FILE="$STATE_FILE" PENDING_DIR="$PENDING_DIR" NOW="$NOW" \
+STATE_FILE="$STATE_FILE" PENDING_DIR="$PENDING_DIR" NOW="$NOW" LOG="$LOG" \
 python3 - <<'PYEOF'
 import json, os, time, hashlib
 
 cwd         = os.environ['CWD']
-started_ms  = int(os.environ['STARTED_AT_MS'])
+started_ms  = int(os.environ.get('STARTED_AT_MS') or 0)
 session_id  = os.environ['SESSION_ID']
 state_file  = os.environ['STATE_FILE']
 pending_dir = os.environ['PENDING_DIR']
+log_file    = os.environ['LOG']
 now         = int(os.environ['NOW'])
 
-limit_type = '5-hour'
+def log(msg):
+    ts = time.strftime('%Y-%m-%d %H:%M:%S')
+    with open(log_file, 'a') as f:
+        f.write(f'[{ts}] [stop] {msg}\n')
+
+limit_type = '5-hour (estimated)'
 reset_at   = 0
 weekly_hit = False
+
+five_reset  = 0
+seven_reset = 0
 
 if os.path.exists(state_file):
     try:
         with open(state_file) as f:
             state = json.load(f)
-        if now - state.get('updated_at', 0) < 1800:
+        age = now - state.get('updated_at', 0)
+        if age < 3600:
             five  = state.get('five_hour', {})
             seven = state.get('seven_day', {})
-            if seven.get('used_pct', 0) >= 95 and seven.get('resets_at', 0) > 0:
-                limit_type = 'weekly'; reset_at = seven['resets_at']; weekly_hit = True
-            elif five.get('resets_at', 0) > 0:
-                limit_type = '5-hour'; reset_at = five['resets_at']
+            five_reset  = five.get('resets_at', 0)
+            seven_reset = seven.get('resets_at', 0)
+            log(f'rate state age={age}s  5h={five.get("used_pct",0):.0f}% resets@{five_reset}  7d={seven.get("used_pct",0):.0f}% resets@{seven_reset}')
+        else:
+            log(f'rate state too old ({age}s) — ignoring')
+    except Exception as e:
+        log(f'could not read rate state: {e}')
+
+# Determine which limit was hit by checking used_pct, then use its reset time.
+# We do NOT use max(reset_times) — the 7-day window always resets later than 5h,
+# so max() would schedule a 7-day wait even when only the 5-hour limit was hit.
+five_pct  = 0
+seven_pct = 0
+if os.path.exists(state_file):
+    try:
+        with open(state_file) as f:
+            state2 = json.load(f)
+        five_pct  = state2.get('five_hour', {}).get('used_pct', 0)
+        seven_pct = state2.get('seven_day', {}).get('used_pct', 0)
     except Exception:
         pass
 
-if reset_at == 0:
-    estimated  = int(started_ms / 1000) + 18000
-    reset_at   = estimated if estimated > now + 60 else now + 7200
-    limit_type = '5-hour (estimated)'
+if seven_pct >= 95 and seven_reset > now:
+    reset_at = seven_reset; weekly_hit = True; limit_type = 'weekly'
+elif five_reset > now:
+    reset_at = five_reset; limit_type = '5-hour'
+else:
+    # No usable reset time — estimate 5h from session start
+    estimated = int(started_ms / 1000) + 18000
+    reset_at  = estimated if estimated > now + 60 else now + 7200
 
 if reset_at <= now:
     reset_at = now + 300
@@ -132,6 +179,7 @@ if reset_at <= now:
 reset_human  = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(reset_at))
 hours_until  = (reset_at - now) / 3600
 project_hash = hashlib.md5(cwd.encode()).hexdigest()[:8]
+project_name = os.path.basename(cwd)
 
 data = {
     'project_dir': cwd, 'checkpoint': os.path.join(cwd, '.claude/checkpoint.md'),
@@ -142,11 +190,12 @@ data = {
 with open(os.path.join(pending_dir, f'{project_hash}.json'), 'w') as f:
     json.dump(data, f, indent=2)
 
-project_name = os.path.basename(cwd)
 if weekly_hit:
+    log(f'⚠️  WEEKLY LIMIT — queued resume for {project_name} at {reset_human} ({hours_until:.1f}h from now)')
     print(f'[espresso] ⚠️  WEEKLY LIMIT hit for {project_name}')
     print(f'[espresso] Resume queued for {reset_human} ({hours_until:.1f}h from now)')
 else:
+    log(f'{limit_type} limit — queued resume for {project_name} at {reset_human} ({hours_until:.1f}h from now)')
     print(f'[espresso] {limit_type} limit — resume queued for {reset_human} ({hours_until:.1f}h from now)')
 PYEOF
 
@@ -187,7 +236,8 @@ STOP_HOOK
 cat > "$HOME/.claude/scripts/statusline-hook.sh" << 'STATUSLINE_HOOK'
 #!/bin/bash
 # Claude Espresso — StatusLine Hook
-# Captures exact 5-hour and 7-day reset timestamps after every response.
+# Captures exact 5-hour and 7-day reset timestamps after every response,
+# and outputs an Espresso status indicator for the Claude Code status bar.
 
 STATE_FILE="$HOME/.claude/rate-limit-state.json"
 TMPFILE=$(mktemp)
@@ -196,23 +246,51 @@ cat > "$TMPFILE"
 
 STATE_FILE="$STATE_FILE" TMPFILE="$TMPFILE" python3 - <<'PYEOF'
 import json, sys, os, time
+
+tmpfile    = os.environ['TMPFILE']
+state_file = os.environ['STATE_FILE']
+
+cwd = ''
 try:
-    with open(os.environ['TMPFILE']) as f:
+    with open(tmpfile) as f:
         data = json.load(f)
+    cwd = data.get('cwd', '') or data.get('session', {}).get('cwd', '')
     rl = data.get('rate_limits', {})
-    if not rl:
-        sys.exit(0)
-    five  = rl.get('five_hour', {})
-    seven = rl.get('seven_day', {})
-    state = {
-        'updated_at': int(time.time()),
-        'five_hour': {'used_pct': five.get('used_percentage', 0), 'resets_at': five.get('resets_at', 0)},
-        'seven_day': {'used_pct': seven.get('used_percentage', 0), 'resets_at': seven.get('resets_at', 0)},
-    }
-    with open(os.environ['STATE_FILE'], 'w') as f:
-        json.dump(state, f, indent=2)
+    if rl:
+        five  = rl.get('five_hour', {})
+        seven = rl.get('seven_day', {})
+        state = {
+            'updated_at': int(time.time()),
+            'five_hour': {'used_pct': five.get('used_percentage', 0), 'resets_at': five.get('resets_at', 0)},
+            'seven_day': {'used_pct': seven.get('used_percentage', 0), 'resets_at': seven.get('resets_at', 0)},
+        }
+        with open(state_file, 'w') as f:
+            json.dump(state, f, indent=2)
 except Exception:
     pass
+
+if cwd:
+    cp       = os.path.join(cwd, '.claude', 'checkpoint.md')
+    settings = os.path.join(cwd, '.claude', 'settings.json')
+    indicator = ''
+    try:
+        if os.path.exists(cp):
+            with open(cp) as f:
+                for line in f:
+                    if line.startswith('status:'):
+                        if 'in_progress' in line:
+                            indicator = '☕ Espresso armed'
+                        break
+        if not indicator and os.path.exists(settings):
+            with open(settings) as f:
+                for line in f:
+                    if 'auto-armed' in line or 'auto-espresso' in line:
+                        indicator = '⚡ Auto-Espresso on'
+                        break
+    except Exception:
+        pass
+    if indicator:
+        print(indicator)
 PYEOF
 
 exit 0
@@ -434,7 +512,7 @@ if os.path.exists(settings_path):
 
 settings['statusLine'] = {'type': 'command', 'command': statusline_cmd}
 
-new_entry = {'hooks': [{'type': 'command', 'command': hook_cmd, 'timeout': 10}]}
+new_entry = {'hooks': [{'type': 'command', 'command': hook_cmd, 'timeout': 30}]}
 if 'hooks' not in settings:
     settings['hooks'] = {}
 existing = settings['hooks'].get('Stop', [])
@@ -514,6 +592,87 @@ PLIST_CONTENT
         ;;
 esac
 
+# ── 11. Prompt Indicator ──────────────────────────────────────────────────────
+
+SHELL_NAME=$(basename "$SHELL")
+SHELL_RC=""
+case "$SHELL_NAME" in
+    zsh)  SHELL_RC="$HOME/.zshrc" ;;
+    bash) SHELL_RC="$HOME/.bashrc" ;;
+esac
+
+if [[ -n "$SHELL_RC" ]]; then
+    if grep -q "# claude-espresso-prompt" "$SHELL_RC" 2>/dev/null; then
+        warn "Prompt indicator already in $SHELL_RC — skipping"
+    else
+        if [[ "$SHELL_NAME" == "zsh" ]]; then
+            cat >> "$SHELL_RC" << 'ZSH_PROMPT'
+
+# claude-espresso-prompt — added by Claude Espresso installer
+_espresso_update() {
+  local cp="$PWD/.claude/checkpoint.md"
+  local s="$PWD/.claude/settings.json"
+  local content
+  if [[ -f $cp ]]; then
+    content=$(<$cp)
+    if [[ $content == *'status: in_progress'* ]]; then
+      ESPRESSO_STATUS='☕ '; return
+    fi
+  fi
+  if [[ -f $s ]]; then
+    content=$(<$s)
+    if [[ $content == *'auto-armed'* || $content == *'auto-espresso'* ]]; then
+      ESPRESSO_STATUS='⚡ '; return
+    fi
+  fi
+  ESPRESSO_STATUS=''
+}
+autoload -Uz add-zsh-hook
+add-zsh-hook chpwd _espresso_update
+_espresso_update
+setopt PROMPT_SUBST
+if [[ "$PROMPT" != *ESPRESSO_STATUS* ]] && [[ "$RPROMPT" != *ESPRESSO_STATUS* ]]; then
+  PROMPT='${ESPRESSO_STATUS}'"$PROMPT"
+fi
+# claude-espresso-prompt-end
+ZSH_PROMPT
+        else
+            cat >> "$SHELL_RC" << 'BASH_PROMPT'
+
+# claude-espresso-prompt — added by Claude Espresso installer
+_espresso_update() {
+  local cp="$PWD/.claude/checkpoint.md"
+  local s="$PWD/.claude/settings.json"
+  local content
+  if [[ -f $cp ]]; then
+    content=$(cat "$cp")
+    if [[ $content == *'status: in_progress'* ]]; then
+      ESPRESSO_STATUS='☕ '; return
+    fi
+  fi
+  if [[ -f $s ]]; then
+    content=$(cat "$s")
+    if [[ $content == *'auto-armed'* || $content == *'auto-espresso'* ]]; then
+      ESPRESSO_STATUS='⚡ '; return
+    fi
+  fi
+  ESPRESSO_STATUS=''
+}
+_espresso_prompt_cmd() { PS1="${ESPRESSO_STATUS}${PS1_BASE:-\u@\h:\w\$ }"; }
+PS1_BASE="${PS1}"
+PROMPT_COMMAND="_espresso_prompt_cmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+cd() { builtin cd "$@" && _espresso_update; }
+_espresso_update
+# claude-espresso-prompt-end
+BASH_PROMPT
+        fi
+        ok "Prompt indicator added to $SHELL_RC"
+        warn "Run: source $SHELL_RC   (or open a new terminal) to activate"
+    fi
+else
+    warn "Unknown shell '$SHELL_NAME' — skipping prompt indicator (run /limit-prompt in Claude Code to install manually)"
+fi
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 
 echo ""
@@ -523,6 +682,11 @@ echo ""
 echo "Commands:"
 echo "  /limit-restart   — arm auto-resume at the start of a big task"
 echo "  /limit-cancel    — cancel a queued resume"
+echo "  /limit-prompt    — install/reinstall the terminal prompt indicator"
+echo ""
+echo "Prompt indicator:"
+echo "  ☕  = task is armed (checkpoint in_progress)"
+echo "  ⚡  = limit-auto is configured for this folder"
 echo ""
 echo "Logs: ~/.claude/espresso.log"
 echo ""
