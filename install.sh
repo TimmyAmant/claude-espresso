@@ -232,6 +232,27 @@ elif [[ "$WEEKLY_HIT" == "no" ]]; then
     rm -f "$WEEKLY_FLAG"
 fi
 
+# Notify user that a resume was queued (fires for every rate limit hit)
+QUEUED_PROJ=$(python3 -c "
+import json, glob, os
+files = glob.glob(os.path.expanduser('~/.claude/pending-resumes/*.json'))
+for pf in sorted(files, key=os.path.getmtime, reverse=True):
+    try:
+        d = json.load(open(pf))
+        print(d.get('resume_at_human','?') + '|' + os.path.basename(d.get('project_dir','')))
+        break
+    except: pass
+" 2>/dev/null)
+if [[ -n "$QUEUED_PROJ" ]]; then
+    RESET_HUMAN="${QUEUED_PROJ%%|*}"
+    PROJ_NAME="${QUEUED_PROJ##*|}"
+    NOTIFY_MSG="Rate limit hit for $PROJ_NAME — resuming at $RESET_HUMAN"
+    case "$(uname -s)" in
+        Darwin) osascript -e "display notification \"$NOTIFY_MSG\" with title \"Claude Espresso ☕\"" 2>/dev/null || true ;;
+        Linux)  notify-send "Claude Espresso ☕" "$NOTIFY_MSG" 2>/dev/null || true ;;
+    esac
+fi
+
 exit 0
 STOP_HOOK
 
@@ -291,7 +312,7 @@ if cwd:
                         if 'in_progress' in line:
                             indicator = '☕ Espresso armed'
                         elif has_auto:
-                            indicator = '⚡ Auto (disarmed)'
+                            indicator = '⚡ Auto ready'
                         break
         elif has_auto:
             indicator = '⚡ Auto-Espresso on'
@@ -374,17 +395,18 @@ for RESUME_FILE in "$PENDING_DIR"/*.json; do
     fi
 
     STATUS=$(grep -m1 '^status:' "$CHECKPOINT" 2>/dev/null | sed 's/status:[[:space:]]*//' | tr -d '"' | tr -d "'" | xargs)
-    if [[ "$STATUS" == "complete" ]]; then
-        log "Task complete in $PROJECT_DIR — removing resume"
+    if [[ "$STATUS" == "complete" || "$STATUS" == "cancelled" || "$STATUS" == "paused" ]]; then
+        log "Checkpoint status='$STATUS' for $(basename "$PROJECT_DIR") — removing resume without launching"
         rm -f "$RESUME_FILE"; continue
     fi
 
-    # Check if a process is already active in this project
-    if pgrep -f "$PROJECT_DIR" >/dev/null 2>&1; then
-        log "Process already active in $(basename "$PROJECT_DIR") — skipping headless resume"; continue
+    # Check if a Claude session is already active in this project — avoid concurrent runs
+    # Use ps+grep to match only claude processes (pgrep -f matches ANY process with the path, too broad)
+    if ps aux | grep "[c]laude" | grep -qF "$PROJECT_DIR" 2>/dev/null; then
+        log "Claude already running in $(basename "$PROJECT_DIR") — skipping headless resume"; continue
     fi
 
-    # Atomic lock using mkdir (POSIX-atomic — prevents TOCTOU race)
+    # Atomic lock using mkdir (POSIX-atomic — prevents TOCTOU race between two concurrent resume-check runs)
     LOCK_DIR="$PROJECT_DIR/.claude/resume.lock"
     if [[ -d "$LOCK_DIR" ]]; then
         LOCK_MTIME=$(file_mtime "$LOCK_DIR" || echo "$NOW")
@@ -394,6 +416,7 @@ for RESUME_FILE in "$PENDING_DIR"/*.json; do
         else
             log "Stale lock for $(basename "$PROJECT_DIR") — removing, will retry next cycle"
             rmdir "$LOCK_DIR" 2>/dev/null || rm -rf "$LOCK_DIR"
+            # Resume JSON still exists (not deleted on launch) so next cycle retries automatically
             continue
         fi
     fi
@@ -402,29 +425,64 @@ for RESUME_FILE in "$PENDING_DIR"/*.json; do
         log "Could not acquire lock for $(basename "$PROJECT_DIR") — skipping"; continue
     fi
 
-    if [[ -z "$CLAUDE_BIN" ]] || [[ ! -x "$CLAUDE_BIN" ]]; then
-        log "ERROR: claude binary not found — cannot resume $(basename "$PROJECT_DIR")"
-        notify "Espresso ERROR: claude not found — resume failed for $(basename "$PROJECT_DIR")"
-        rmdir "$LOCK_DIR" 2>/dev/null; continue
+    # Verify claude binary exists before attempting launch
+    if [[ ! -x "$CLAUDE_BIN" ]]; then
+        log "ERROR: claude binary not found at '$CLAUDE_BIN' — cannot resume $(basename "$PROJECT_DIR")"
+        notify "Espresso ERROR: claude binary not found — resume failed for $(basename "$PROJECT_DIR")"
+        rmdir "$LOCK_DIR" 2>/dev/null
+        continue
     fi
 
     log "Resuming [$LIMIT_TYPE] task in $PROJECT_DIR"
     notify "Resuming $(basename "$PROJECT_DIR") — rate limit window reset"
 
-    # Output routed to per-run log — keeps espresso.log clean and avoids trim races
+    # Route headless Claude output to a per-run log (keeps espresso.log clean, avoids trim races)
     RUN_LOG="$HOME/.claude/espresso-run-$(date +%Y%m%d-%H%M%S)-$$.log"
 
-    # Resume JSON NOT deleted here — Claude deletes it on completion (see prompt).
-    # If Claude crashes, stale lock cleanup above triggers a retry on the next cycle.
+    # The resume JSON is NOT deleted here. Claude deletes it on completion (see prompt below).
+    # If Claude crashes mid-run, the stale lock cleanup above will trigger a retry next cycle.
     RESUME_BASENAME=$(basename "$RESUME_FILE")
     RESUMED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    (
-        cd "$PROJECT_DIR" &&
-        nohup "$CLAUDE_BIN" --dangerously-skip-permissions -p \
-            "Read .claude/checkpoint.md. Immediately add 'resumed_at: $RESUMED_AT' to the Notes section. Then resume the task exactly from where it left off — continue from the Current step. After each step, update Completed steps and Current step. When the full task is done: (1) set status to complete in checkpoint.md, (2) delete the lock directory at .claude/resume.lock, (3) delete $HOME/.claude/pending-resumes/$RESUME_BASENAME." \
-            >> "$RUN_LOG" 2>&1 &
-        log "Launched resume (PID: $!) for $(basename "$PROJECT_DIR") — output: $RUN_LOG"
-    )
+    PROJECT_NAME=$(basename "$PROJECT_DIR")
+
+    # Write a per-resume wrapper script — avoids nested quoting complexity and is debuggable
+    WRAPPER=$(mktemp "$HOME/.claude/.espresso-run-XXXXXX.sh")
+    chmod 700 "$WRAPPER"
+    {
+        # Use printf %q to safely embed all paths/values (handles spaces, quotes, special chars)
+        printf '#!/bin/bash\n'
+        printf 'CLAUDE_BIN=%q\n'    "$CLAUDE_BIN"
+        printf 'PROJECT_DIR=%q\n'   "$PROJECT_DIR"
+        printf 'CHECKPOINT=%q\n'    "$CHECKPOINT"
+        printf 'LOCK_DIR=%q\n'      "$LOCK_DIR"
+        printf 'RESUME_FILE=%q\n'   "$PENDING_DIR/$RESUME_BASENAME"
+        printf 'RUN_LOG=%q\n'       "$RUN_LOG"
+        printf 'LOG=%q\n'           "$LOG"
+        printf 'PROJECT_NAME=%q\n'  "$PROJECT_NAME"
+        printf 'RESUMED_AT=%q\n'    "$RESUMED_AT"
+        # shellcheck disable=SC2016 — single-quoted INNER: $ signs are literal here, expand in wrapper
+        cat << 'INNER'
+cd "$PROJECT_DIR" || exit 1
+PROMPT="Read .claude/checkpoint.md. Immediately add 'resumed_at: ${RESUMED_AT}' to the Notes section. Then resume the task exactly from where it left off — continue from the Current step. After each step, update Completed steps and Current step fields. When the full task is done: (1) set status to complete in checkpoint.md, (2) delete the lock directory .claude/resume.lock, (3) delete the resume file at ${RESUME_FILE}."
+"$CLAUDE_BIN" --dangerously-skip-permissions -p "$PROMPT" >> "$RUN_LOG" 2>&1 || true
+STATUS_AFTER=$(grep -m1 '^status:' "$CHECKPOINT" 2>/dev/null | sed 's/status:[[:space:]]*//' | tr -d '"' | tr -d "'" | xargs)
+if [[ "$STATUS_AFTER" == "complete" ]]; then
+    osascript -e "display notification \"$PROJECT_NAME task complete\" with title \"Claude Espresso ☕\"" 2>/dev/null || \
+    notify-send "Claude Espresso ☕" "$PROJECT_NAME task complete" 2>/dev/null || true
+    rmdir "$LOCK_DIR" 2>/dev/null || rm -rf "$LOCK_DIR" 2>/dev/null
+    rm -f "$RESUME_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [resume] Task complete for $PROJECT_NAME" >> "$LOG"
+else
+    osascript -e "display notification \"$PROJECT_NAME resume ended — check log\" with title \"Claude Espresso ☕\" sound name \"Basso\"" 2>/dev/null || \
+    notify-send "Claude Espresso ☕" "$PROJECT_NAME resume ended — check log" 2>/dev/null || true
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [resume] Resume ended (status=$STATUS_AFTER) for $PROJECT_NAME" >> "$LOG"
+fi
+rm -f "$0"
+INNER
+    } > "$WRAPPER"
+
+    nohup bash "$WRAPPER" >> "$LOG" 2>&1 &
+    log "Launched resume (PID: $!) for $PROJECT_NAME — output: $RUN_LOG"
 done
 RESUME_CHECK
 
@@ -505,7 +563,7 @@ When this skill is invoked:
 python3 -c "
 import hashlib, os, glob, json
 cwd = os.getcwd()
-h = hashlib.md5(cwd.encode()).hexdigest()[:8]
+h = hashlib.md5(cwd.encode()).hexdigest()
 f = os.path.expanduser(f'~/.claude/pending-resumes/{h}.json')
 if os.path.exists(f):
     os.remove(f); print('Pending resume removed.')
@@ -604,6 +662,13 @@ case "$PLATFORM" in
 </plist>
 PLIST_CONTENT
         launchctl unload "$PLIST" 2>/dev/null || true
+        # Clean up old plist from pre-v2 installs (different label, would conflict)
+        OLD_PLIST="$HOME/Library/LaunchAgents/com.claudecode.autoresume.plist"
+        if [[ -f "$OLD_PLIST" ]]; then
+            launchctl unload "$OLD_PLIST" 2>/dev/null || true
+            rm -f "$OLD_PLIST"
+            warn "Removed old launchd agent: com.claudecode.autoresume (replaced by com.claude.espresso)"
+        fi
         launchctl load "$PLIST"
         ok "Background checker installed via launchd (every 15 min)"
         ;;
