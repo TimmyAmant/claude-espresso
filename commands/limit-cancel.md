@@ -24,12 +24,14 @@ print('Status set to: cancelled')
 "
 ```
 
-3. Delete `.claude/resume.lock` if it exists in this project:
+3. Delete `.claude/resume.lock` if it exists in this project (it's a directory used as an atomic lock):
 ```bash
 python3 -c "
-import os
+import os, shutil
 lock = os.path.join(os.getcwd(), '.claude/resume.lock')
-if os.path.exists(lock):
+if os.path.isdir(lock):
+    shutil.rmtree(lock); print('resume.lock removed.')
+elif os.path.exists(lock):
     os.remove(lock); print('resume.lock removed.')
 "
 ```
@@ -39,7 +41,7 @@ if os.path.exists(lock):
 python3 -c "
 import hashlib, os, glob, json
 cwd = os.getcwd()
-h = hashlib.md5(cwd.encode()).hexdigest()[:8]
+h = hashlib.md5(cwd.encode()).hexdigest()
 f = os.path.expanduser(f'~/.claude/pending-resumes/{h}.json')
 if os.path.exists(f):
     os.remove(f); print('Pending resume removed.')
@@ -60,7 +62,7 @@ else:
 python3 -c "
 import hashlib, os
 cwd = os.getcwd()
-h = hashlib.md5(cwd.encode()).hexdigest()[:8]
+h = hashlib.md5(cwd.encode()).hexdigest()
 label = f'com.claude.espresso.notify.{h}'
 plist = os.path.expanduser(f'~/Library/LaunchAgents/{label}.plist')
 if os.path.exists(plist):

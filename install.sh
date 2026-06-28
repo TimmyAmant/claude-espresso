@@ -71,27 +71,25 @@ mkdir -p "$PENDING_DIR"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [stop] $1" >> "$LOG"; }
 
 HOOK_INPUT=$(cat)
-SESSION_ID=$(echo "$HOOK_INPUT" | jq -r '.session_id // .sessionId // ""')
-if [[ -z "$SESSION_ID" ]]; then
-    log "no session_id in hook input — skipping"
-    exit 0
+
+# Read cwd directly from hook input — avoids O(n) session file scan
+CWD=$(echo "$HOOK_INPUT" | jq -r '.cwd // ""' 2>/dev/null)
+SESSION_ID=$(echo "$HOOK_INPUT" | jq -r '.session_id // .sessionId // ""' 2>/dev/null)
+
+# Fall back to session file scan if cwd not in hook input
+if [[ -z "$CWD" ]] && [[ -n "$SESSION_ID" ]]; then
+    for f in "$HOME/.claude/sessions/"*.json; do
+        [[ -f "$f" ]] || continue
+        SID=$(jq -r '.sessionId // ""' "$f" 2>/dev/null)
+        if [[ "$SID" == "$SESSION_ID" ]]; then
+            CWD=$(jq -r '.cwd // ""' "$f" 2>/dev/null)
+            break
+        fi
+    done
 fi
 
-SESSION_FILE=""
-for f in "$HOME/.claude/sessions/"*.json; do
-    [[ -f "$f" ]] || continue
-    SID=$(jq -r '.sessionId // ""' "$f" 2>/dev/null)
-    if [[ "$SID" == "$SESSION_ID" ]]; then SESSION_FILE="$f"; break; fi
-done
-if [[ -z "$SESSION_FILE" ]]; then
-    log "no session file found for session_id=$SESSION_ID — skipping"
-    exit 0
-fi
-
-CWD=$(jq -r '.cwd // ""' "$SESSION_FILE" 2>/dev/null)
-STARTED_AT_MS=$(jq -r '.startedAt // 0' "$SESSION_FILE" 2>/dev/null)
 if [[ -z "$CWD" ]]; then
-    log "no cwd in session file $SESSION_FILE — skipping"
+    log "no cwd in hook input — skipping"
     exit 0
 fi
 
@@ -109,14 +107,27 @@ fi
 
 NOW=$(date +%s)
 
-CWD="$CWD" STARTED_AT_MS="$STARTED_AT_MS" SESSION_ID="$SESSION_ID" \
+# Get startedAt for estimation fallback
+STARTED_AT_MS=$(echo "$HOOK_INPUT" | jq -r '.startedAt // 0' 2>/dev/null)
+if [[ "$STARTED_AT_MS" == "0" ]] && [[ -n "$SESSION_ID" ]]; then
+    for f in "$HOME/.claude/sessions/"*.json; do
+        [[ -f "$f" ]] || continue
+        SID=$(jq -r '.sessionId // ""' "$f" 2>/dev/null)
+        if [[ "$SID" == "$SESSION_ID" ]]; then
+            STARTED_AT_MS=$(jq -r '.startedAt // 0' "$f" 2>/dev/null)
+            break
+        fi
+    done
+fi
+
+CWD="$CWD" STARTED_AT_MS="${STARTED_AT_MS:-0}" SESSION_ID="${SESSION_ID:-}" \
 STATE_FILE="$STATE_FILE" PENDING_DIR="$PENDING_DIR" NOW="$NOW" LOG="$LOG" \
 python3 - <<'PYEOF'
 import json, os, time, hashlib
 
 cwd         = os.environ['CWD']
 started_ms  = int(os.environ.get('STARTED_AT_MS') or 0)
-session_id  = os.environ['SESSION_ID']
+session_id  = os.environ.get('SESSION_ID', '')
 state_file  = os.environ['STATE_FILE']
 pending_dir = os.environ['PENDING_DIR']
 log_file    = os.environ['LOG']
@@ -127,13 +138,15 @@ def log(msg):
     with open(log_file, 'a') as f:
         f.write(f'[{ts}] [stop] {msg}\n')
 
-limit_type = '5-hour (estimated)'
-reset_at   = 0
-weekly_hit = False
-
+limit_type  = '5-hour (estimated)'
+reset_at    = 0
+weekly_hit  = False
+five_pct    = 0
+seven_pct   = 0
 five_reset  = 0
 seven_reset = 0
 
+# Read state file ONCE — prevents inconsistency from concurrent statusline writes
 if os.path.exists(state_file):
     try:
         with open(state_file) as f:
@@ -144,45 +157,36 @@ if os.path.exists(state_file):
             seven = state.get('seven_day', {})
             five_reset  = five.get('resets_at', 0)
             seven_reset = seven.get('resets_at', 0)
-            log(f'rate state age={age}s  5h={five.get("used_pct",0):.0f}% resets@{five_reset}  7d={seven.get("used_pct",0):.0f}% resets@{seven_reset}')
+            five_pct    = five.get('used_pct', 0)
+            seven_pct   = seven.get('used_pct', 0)
+            log(f'rate state age={age}s  5h={five_pct:.0f}% resets@{five_reset}  7d={seven_pct:.0f}% resets@{seven_reset}')
         else:
-            log(f'rate state too old ({age}s) — ignoring')
+            log(f'rate state too old ({age}s) — will estimate reset time')
     except Exception as e:
         log(f'could not read rate state: {e}')
 
-# Determine which limit was hit by checking used_pct, then use its reset time.
-# We do NOT use max(reset_times) — the 7-day window always resets later than 5h,
-# so max() would schedule a 7-day wait even when only the 5-hour limit was hit.
-five_pct  = 0
-seven_pct = 0
-if os.path.exists(state_file):
-    try:
-        with open(state_file) as f:
-            state2 = json.load(f)
-        five_pct  = state2.get('five_hour', {}).get('used_pct', 0)
-        seven_pct = state2.get('seven_day', {}).get('used_pct', 0)
-    except Exception:
-        pass
-
+# Determine which limit was hit. Do NOT use max(reset_times) —
+# 7-day always resets later and would cause a 7-day wait for every 5-hour hit.
 if seven_pct >= 95 and seven_reset > now:
     reset_at = seven_reset; weekly_hit = True; limit_type = 'weekly'
 elif five_reset > now:
     reset_at = five_reset; limit_type = '5-hour'
 else:
-    # No usable reset time — estimate 5h from session start
     estimated = int(started_ms / 1000) + 18000
     reset_at  = estimated if estimated > now + 60 else now + 7200
+    limit_type = '5-hour (estimated)'
 
 if reset_at <= now:
     reset_at = now + 300
 
 reset_human  = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(reset_at))
 hours_until  = (reset_at - now) / 3600
-project_hash = hashlib.md5(cwd.encode()).hexdigest()[:8]
+project_hash = hashlib.md5(cwd.encode()).hexdigest()
 project_name = os.path.basename(cwd)
 
 data = {
-    'project_dir': cwd, 'checkpoint': os.path.join(cwd, '.claude/checkpoint.md'),
+    'project_dir': cwd,
+    'checkpoint': os.path.join(cwd, '.claude/checkpoint.md'),
     'resume_at': reset_at, 'resume_at_human': reset_human,
     'limit_type': limit_type, 'weekly_hit': weekly_hit,
     'queued_at': now, 'session_id': session_id,
@@ -191,20 +195,20 @@ with open(os.path.join(pending_dir, f'{project_hash}.json'), 'w') as f:
     json.dump(data, f, indent=2)
 
 if weekly_hit:
-    log(f'⚠️  WEEKLY LIMIT — queued resume for {project_name} at {reset_human} ({hours_until:.1f}h from now)')
-    print(f'[espresso] ⚠️  WEEKLY LIMIT hit for {project_name}')
+    log(f'WEEKLY LIMIT — queued resume for {project_name} at {reset_human} ({hours_until:.1f}h from now)')
+    print(f'[espresso] WEEKLY LIMIT hit for {project_name}')
     print(f'[espresso] Resume queued for {reset_human} ({hours_until:.1f}h from now)')
 else:
     log(f'{limit_type} limit — queued resume for {project_name} at {reset_human} ({hours_until:.1f}h from now)')
     print(f'[espresso] {limit_type} limit — resume queued for {reset_human} ({hours_until:.1f}h from now)')
 PYEOF
 
-# Weekly limit notification — platform-specific
+# Platform-specific notification for weekly limit
 WEEKLY_FLAG="$HOME/.claude/pending-resumes/.weekly-notified"
 WEEKLY_HIT=$(python3 -c "
 import json, glob, os
 files = glob.glob(os.path.expanduser('~/.claude/pending-resumes/*.json'))
-print('yes' if any(json.load(open(f)).get('weekly_hit') for f in files) else 'no')
+print('yes' if any(json.load(open(f)).get('weekly_hit') for f in files if not f.endswith('.running')) else 'no')
 " 2>/dev/null)
 
 if [[ "$WEEKLY_HIT" == "yes" ]] && [[ ! -f "$WEEKLY_FLAG" ]]; then
@@ -274,19 +278,23 @@ if cwd:
     settings = os.path.join(cwd, '.claude', 'settings.json')
     indicator = ''
     try:
+        has_auto = False
+        if os.path.exists(settings):
+            with open(settings) as f:
+                content = f.read()
+                has_auto = 'auto-armed' in content or 'auto-espresso' in content
+
         if os.path.exists(cp):
             with open(cp) as f:
                 for line in f:
                     if line.startswith('status:'):
                         if 'in_progress' in line:
                             indicator = '☕ Espresso armed'
+                        elif has_auto:
+                            indicator = '⚡ Auto (disarmed)'
                         break
-        if not indicator and os.path.exists(settings):
-            with open(settings) as f:
-                for line in f:
-                    if 'auto-armed' in line or 'auto-espresso' in line:
-                        indicator = '⚡ Auto-Espresso on'
-                        break
+        elif has_auto:
+            indicator = '⚡ Auto-Espresso on'
     except Exception:
         pass
     if indicator:
@@ -298,92 +306,124 @@ STATUSLINE_HOOK
 
 # ── 6. Resume Checker ─────────────────────────────────────────────────────────
 
-cat > "$HOME/.claude/scripts/resume-check.sh" << RESUME_CHECK
+cat > "$HOME/.claude/scripts/resume-check.sh" << 'RESUME_CHECK'
 #!/bin/bash
 # Claude Espresso — Resume Checker
-# Runs every 15 minutes. Fires resumes when the reset time passes.
+# Runs every 15 minutes via launchd/cron. Fires resumes when the reset time passes.
 
-PENDING_DIR="\$HOME/.claude/pending-resumes"
-CLAUDE_BIN="$CLAUDE_BIN"
-LOG="\$HOME/.claude/espresso.log"
-NOW=\$(date +%s)
+PENDING_DIR="$HOME/.claude/pending-resumes"
+LOG="$HOME/.claude/espresso.log"
+NOW=$(date +%s)
 
-log() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG"; }
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [resume] $1" >> "$LOG"; }
 
-# Trim log to last 500 lines
-if [[ -f "\$LOG" ]] && [[ \$(wc -l < "\$LOG") -gt 500 ]]; then
-    tail -n 500 "\$LOG" > "\$LOG.tmp" && mv "\$LOG.tmp" "\$LOG"
-fi
-
-[[ -d "\$PENDING_DIR" ]] || exit 0
-
-# Cross-platform file modification time
-file_mtime() {
-    case "\$(uname -s)" in
-        Darwin) date -r "\$1" +%s 2>/dev/null ;;
-        *)      stat -c %Y "\$1" 2>/dev/null ;;
+notify() {
+    local msg="$1"
+    case "$(uname -s)" in
+        Darwin) osascript -e "display notification \"$msg\" with title \"Claude Espresso ☕\"" 2>/dev/null || true ;;
+        Linux)  notify-send "Claude Espresso ☕" "$msg" 2>/dev/null || true ;;
     esac
 }
 
-for RESUME_FILE in "\$PENDING_DIR"/*.json; do
-    [[ -f "\$RESUME_FILE" ]] || continue
+# Safe log rotation using mktemp (avoids symlink attack via predictable path)
+if [[ -f "$LOG" ]] && [[ $(wc -l < "$LOG") -gt 500 ]]; then
+    LOGTMP=$(mktemp "$HOME/.claude/.espresso.log.XXXXXX")
+    tail -n 500 "$LOG" > "$LOGTMP" && mv "$LOGTMP" "$LOG" || rm -f "$LOGTMP"
+fi
 
-    unset PROJECT_DIR CHECKPOINT RESUME_AT LIMIT_TYPE PARSE_ERROR
+[[ -d "$PENDING_DIR" ]] || exit 0
 
-    eval "\$(RESUME_FILE="\$RESUME_FILE" python3 - <<'PYEOF'
-import json, os
-try:
-    with open(os.environ['RESUME_FILE']) as f:
-        d = json.load(f)
-    print(f"PROJECT_DIR={repr(d['project_dir'])}")
-    print(f"CHECKPOINT={repr(d['checkpoint'])}")
-    print(f"RESUME_AT={d['resume_at']}")
-    print(f"LIMIT_TYPE={repr(d.get('limit_type','5-hour'))}")
-except Exception as e:
-    print(f"PARSE_ERROR={repr(str(e))}")
-PYEOF
-)"
+# Resolve claude binary dynamically — don't rely on hardcoded install-time path
+CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo "")}"
 
-    if [[ -n "\${PARSE_ERROR:-}" ]]; then
-        log "Failed to parse \$RESUME_FILE — skipping"; continue
+# Cross-platform file modification time
+file_mtime() {
+    case "$(uname -s)" in
+        Darwin) stat -f %m "$1" 2>/dev/null ;;
+        *)      stat -c %Y "$1" 2>/dev/null ;;
+    esac
+}
+
+for RESUME_FILE in "$PENDING_DIR"/*.json; do
+    [[ -f "$RESUME_FILE" ]] || continue
+
+    # Parse with jq — no eval, no shell injection possible
+    PROJECT_DIR=$(jq -r '.project_dir // empty' "$RESUME_FILE" 2>/dev/null)
+    CHECKPOINT=$(jq -r '.checkpoint // empty' "$RESUME_FILE" 2>/dev/null)
+    RESUME_AT=$(jq -r '.resume_at // empty' "$RESUME_FILE" 2>/dev/null)
+    LIMIT_TYPE=$(jq -r '.limit_type // "5-hour"' "$RESUME_FILE" 2>/dev/null)
+
+    if [[ -z "$PROJECT_DIR" ]] || [[ -z "$RESUME_AT" ]]; then
+        log "Failed to parse $RESUME_FILE — skipping"; continue
     fi
 
-    if [[ \$NOW -lt \$RESUME_AT ]]; then
-        REMAINING=\$(( RESUME_AT - NOW ))
-        log "[\$LIMIT_TYPE] Waiting for \$(basename "\$PROJECT_DIR") — \$(( REMAINING / 3600 ))h \$(( (REMAINING % 3600) / 60 ))m remaining"
+    RESUME_AT_INT=${RESUME_AT%.*}
+    if ! [[ "$RESUME_AT_INT" =~ ^[0-9]+$ ]]; then
+        log "Invalid RESUME_AT '$RESUME_AT' in $RESUME_FILE — skipping"; continue
+    fi
+
+    if [[ $NOW -lt $RESUME_AT_INT ]]; then
+        REMAINING=$(( RESUME_AT_INT - NOW ))
+        log "[$LIMIT_TYPE] Waiting for $(basename "$PROJECT_DIR") — $(( REMAINING / 3600 ))h $(( (REMAINING % 3600) / 60 ))m remaining"
         continue
     fi
 
-    if [[ ! -f "\$CHECKPOINT" ]]; then
-        log "Checkpoint gone — removing resume"; rm -f "\$RESUME_FILE"; continue
+    if [[ ! -f "$CHECKPOINT" ]]; then
+        log "Checkpoint gone for $PROJECT_DIR — removing resume"
+        rm -f "$RESUME_FILE"; continue
     fi
 
-    STATUS=\$(grep -m1 '^status:' "\$CHECKPOINT" 2>/dev/null | sed 's/status:[[:space:]]*//' | tr -d '"' | tr -d "'" | xargs)
-    if [[ "\$STATUS" == "complete" ]]; then
-        log "Task complete in \$PROJECT_DIR — removing resume"; rm -f "\$RESUME_FILE"; continue
+    STATUS=$(grep -m1 '^status:' "$CHECKPOINT" 2>/dev/null | sed 's/status:[[:space:]]*//' | tr -d '"' | tr -d "'" | xargs)
+    if [[ "$STATUS" == "complete" ]]; then
+        log "Task complete in $PROJECT_DIR — removing resume"
+        rm -f "$RESUME_FILE"; continue
     fi
 
-    LOCK_FILE="\$PROJECT_DIR/.claude/resume.lock"
-    if [[ -f "\$LOCK_FILE" ]]; then
-        LOCK_MTIME=\$(file_mtime "\$LOCK_FILE" || echo "\$NOW")
-        LOCK_AGE=\$(( NOW - LOCK_MTIME ))
-        if [[ \$LOCK_AGE -lt 3600 ]]; then
-            log "Resume already running for \$(basename "\$PROJECT_DIR") (lock age: \${LOCK_AGE}s)"; continue
+    # Check if a process is already active in this project
+    if pgrep -f "$PROJECT_DIR" >/dev/null 2>&1; then
+        log "Process already active in $(basename "$PROJECT_DIR") — skipping headless resume"; continue
+    fi
+
+    # Atomic lock using mkdir (POSIX-atomic — prevents TOCTOU race)
+    LOCK_DIR="$PROJECT_DIR/.claude/resume.lock"
+    if [[ -d "$LOCK_DIR" ]]; then
+        LOCK_MTIME=$(file_mtime "$LOCK_DIR" || echo "$NOW")
+        LOCK_AGE=$(( NOW - LOCK_MTIME ))
+        if [[ $LOCK_AGE -lt 3600 ]]; then
+            log "Resume already running for $(basename "$PROJECT_DIR") (lock age: ${LOCK_AGE}s)"; continue
         else
-            log "Stale lock — removing"; rm -f "\$LOCK_FILE"
+            log "Stale lock for $(basename "$PROJECT_DIR") — removing, will retry next cycle"
+            rmdir "$LOCK_DIR" 2>/dev/null || rm -rf "$LOCK_DIR"
+            continue
         fi
     fi
 
-    rm -f "\$RESUME_FILE"
-    touch "\$LOCK_FILE"
-    log "Resuming [\$LIMIT_TYPE] task in \$PROJECT_DIR"
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        log "Could not acquire lock for $(basename "$PROJECT_DIR") — skipping"; continue
+    fi
 
+    if [[ -z "$CLAUDE_BIN" ]] || [[ ! -x "$CLAUDE_BIN" ]]; then
+        log "ERROR: claude binary not found — cannot resume $(basename "$PROJECT_DIR")"
+        notify "Espresso ERROR: claude not found — resume failed for $(basename "$PROJECT_DIR")"
+        rmdir "$LOCK_DIR" 2>/dev/null; continue
+    fi
+
+    log "Resuming [$LIMIT_TYPE] task in $PROJECT_DIR"
+    notify "Resuming $(basename "$PROJECT_DIR") — rate limit window reset"
+
+    # Output routed to per-run log — keeps espresso.log clean and avoids trim races
+    RUN_LOG="$HOME/.claude/espresso-run-$(date +%Y%m%d-%H%M%S)-$$.log"
+
+    # Resume JSON NOT deleted here — Claude deletes it on completion (see prompt).
+    # If Claude crashes, stale lock cleanup above triggers a retry on the next cycle.
+    RESUME_BASENAME=$(basename "$RESUME_FILE")
+    RESUMED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     (
-        cd "\$PROJECT_DIR" && \
-        nohup "\$CLAUDE_BIN" --dangerously-skip-permissions -p \
-            "Read .claude/checkpoint.md. First, immediately add a 'resumed_at' timestamp to the Notes section so this session is recorded even if interrupted. Then resume the task exactly from where it left off. After each step you complete, update the Completed steps and Current step fields. When the full task is done, set status to complete and delete .claude/resume.lock." \
-            >> "\$LOG" 2>&1 &
-        log "Launched resume process (PID: \$!) for \$(basename "\$PROJECT_DIR")"
+        cd "$PROJECT_DIR" &&
+        nohup "$CLAUDE_BIN" --dangerously-skip-permissions -p \
+            "Read .claude/checkpoint.md. Immediately add 'resumed_at: $RESUMED_AT' to the Notes section. Then resume the task exactly from where it left off — continue from the Current step. After each step, update Completed steps and Current step. When the full task is done: (1) set status to complete in checkpoint.md, (2) delete the lock directory at .claude/resume.lock, (3) delete $HOME/.claude/pending-resumes/$RESUME_BASENAME." \
+            >> "$RUN_LOG" 2>&1 &
+        log "Launched resume (PID: $!) for $(basename "$PROJECT_DIR") — output: $RUN_LOG"
     )
 done
 RESUME_CHECK

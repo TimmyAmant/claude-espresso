@@ -45,7 +45,7 @@ auto_hook = {
     "matcher": "",
     "hooks": [{
         "type": "command",
-        "command": f"PDIR={pdir_q}; CP=\"$PDIR/.claude/checkpoint.md\"; if [ ! -f \"$CP\" ]; then mkdir -p \"$PDIR/.claude\" && {{ printf 'status: in_progress\\nproject_dir: '; printf '%s\\n' \"$PDIR\"; printf 'task: (auto-armed - update with task details)\\nstarted_at: '; date -u +%Y-%m-%dT%H:%M:%SZ; printf '\\n## Task breakdown\\n(not yet set)\\n\\n## Completed steps\\n(none yet)\\n\\n## Current step\\n(not yet set)\\n\\n## Next step\\n(not yet set)\\n\\n## Files modified\\n(none yet)\\n\\n## Notes\\n(auto-armed by limit-auto)\\n'; }} > \"$CP\"; fi",
+        "command": f"PDIR={pdir_q}; CP=\"$PDIR/.claude/checkpoint.md\"; if [ ! -f \"$CP\" ]; then mkdir -p \"$PDIR/.claude\" && {{ printf 'status: in_progress\\nproject_dir: '; printf '%s\\n' \"$PDIR\"; printf 'task: (auto-armed - update with task details)\\nstarted_at: '; date -u +%Y-%m-%dT%H:%M:%SZ; printf '\\n## Task breakdown\\n(not yet set)\\n\\n## Completed steps\\n(none yet)\\n\\n## Current step\\n(not yet set)\\n\\n## Next step\\n(not yet set)\\n\\n## Files modified\\n(none yet)\\n\\n## Notes\\n(auto-armed by limit-auto)\\n'; }} > \"$CP\"; elif grep -qE '^status: (complete|cancelled|paused)' \"$CP\"; then sed -i '' 's/^status: .*/status: in_progress/' \"$CP\" && echo '[espresso] Auto-Espresso re-armed for new session'; fi",
         "timeout": 5
     }]
 }
